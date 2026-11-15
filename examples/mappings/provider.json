@@ -1,0 +1,5 @@
+{
+  "event_id": "/notification_id", "payment_id": "/transaction/reference", "version": "/transaction/version",
+  "amount_minor": "/transaction/amount", "currency": "/transaction/ccy", "status": "/transaction/status",
+  "statuses": {"settled": "Completed", "processing": "Pending", "rejected": "Failed"}
+}

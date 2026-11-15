@@ -7,12 +7,14 @@ Start with the [project README](../README.md). Each topic below has one primary 
 - [GPU API](GPU_API.md): setup, authentication, endpoints, checkpoints and recovery.
 - [GPU architecture](GPU_ARCHITECTURE.md): guarantees, limitations and roadmap.
 - [Kafka streaming](KAFKA_STREAMING.md): synthetic sources, durable ingestion and fault testing.
+- [GPU operations](GPU_OPERATIONS.md): concurrency, mappings, scoped access, findings and investigation.
 - [GPU OpenAPI](openapi-gpu.json): machine-readable interface.
 
 ## Measurements
 
 - [Background checkpoints](performance/gpu-api-background-checkpoints.md): latest million-payment API comparison.
-- [Kafka streaming](performance/kafka-gpu-streaming.md): sustained flow, burst and restart results.
+- [Kafka concurrency and batching](performance/gpu-streaming-product.md): implementation, validation status and repeatable comparisons.
+- [Earlier Kafka polling](performance/kafka-gpu-streaming.md): original streaming baseline.
 - [Earlier checkpoint comparison](performance/gpu-api-checkpoint-comparison.md).
 - [Resident GPU experiments](performance/gpu-resident.md).
 - [CPU/GPU comparison](performance/cpu-gpu-comparison.md): historical baseline, retained for traceability.

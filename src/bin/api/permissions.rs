@@ -37,13 +37,14 @@ impl Principal {
         match self.role {
             Role::Administrator => true,
             Role::InternalWriter | Role::ProviderWriter => {
-                *method == Method::POST && route == "/v1/events"
+                *method == Method::POST && matches!(route, "/v1/events" | "/v1/gpu/events")
             }
             Role::Investigator => {
                 *method == Method::POST
                     && matches!(
                         route,
                         "/v1/payments/{payment_id}/investigation"
+                            | "/v1/gpu/payments/{payment_id}/investigation"
                             | "/v1/payments/{payment_id}/case"
                     )
             }

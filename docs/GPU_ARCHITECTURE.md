@@ -91,8 +91,10 @@ CPU/GPU comparisons, including results where GPU was slower, to make performance
 claims auditable. The resident-worker results establish a useful incremental design;
 they do not establish durable API throughput.
 
-Next GPU work: finer latency telemetry; incremental checkpoint manifests and retention;
-source-scoped credentials and tenant-isolated GPU slots;
-integration of waiting/history policies; device-loss supervision; multi-GPU routing
-with explicit ownership and recovery. Each step needs correctness and latency
-evidence before increasing deployment claims.
+The [GPU operations layer](GPU_OPERATIONS.md) adds per-source credentials within a
+dedicated tenant process, a durable findings cursor, indexed history and separate
+investigation notes. Matching-window presentation is evaluated on reads.
+
+Next GPU work: incremental checkpoint manifests and retention; tenant-isolated GPU
+slots; automatic deadline events; device-loss supervision; multi-GPU routing with
+explicit ownership and recovery. Each step needs correctness and latency evidence.

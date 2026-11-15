@@ -1,0 +1,5 @@
+[
+  {"notification_id":"provider-map-1","transaction":{"reference":"MAP-001","version":1,"amount":10000,"ccy":"gbp","status":"processing"}},
+  {"notification_id":"provider-map-2","transaction":{"reference":"MAP-001","version":2,"amount":10000,"ccy":"gbp","status":"settled"}},
+  {"notification_id":"provider-map-3","transaction":{"reference":"MAP-002","version":1,"amount":4500,"ccy":"gbp","status":"settled"}}
+]

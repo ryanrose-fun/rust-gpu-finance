@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use std::{
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -30,24 +30,217 @@ fn api(root: &Path, port: u16, capacity: usize) -> Process {
     for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("RECONCILE_")) {
         c.env_remove(k);
     }
-    Process(
-        c.env("RECONCILE_BIND", format!("127.0.0.1:{port}"))
-            .env("RECONCILE_API_KEY", KEY)
-            .env("RECONCILE_GPU_DB_PATH", root.join("gpu.sqlite3"))
-            .env("RECONCILE_DB_PATH", root.join("events.sqlite3"))
-            .env("RECONCILE_GPU_CAPACITY", capacity.to_string())
-            .env("RECONCILE_REQUESTS_PER_SECOND", "10000")
-            .env("RECONCILE_GPU_PROFILE", "1")
-            .env("RECONCILE_MAX_BODY_BYTES", "16777216")
-            .stdout(log(root, "api.out.log"))
-            .stderr(log(root, "api.err.log"))
-            .spawn()
-            .unwrap(),
-    )
+    let scoped = root.join("tenant.json").exists();
+    c.env("RECONCILE_API_KEY_STDIN", "1").stdin(Stdio::piped());
+    if scoped {
+        c.env_remove("RECONCILE_API_KEY")
+            .env_remove("RECONCILE_API_KEY_STDIN")
+            .env("RECONCILE_TENANTS_FILE", root.join("tenant.json"));
+    }
+    let mut child = c
+        .env("RECONCILE_BIND", format!("127.0.0.1:{port}"))
+        .env("RECONCILE_GPU_DB_PATH", root.join("gpu.sqlite3"))
+        .env("RECONCILE_DB_PATH", root.join("events.sqlite3"))
+        .env("RECONCILE_GPU_CAPACITY", capacity.to_string())
+        .env("RECONCILE_REQUESTS_PER_SECOND", "10000")
+        .env("RECONCILE_GPU_PROFILE", "1")
+        .env("RECONCILE_MAX_BODY_BYTES", "16777216")
+        .stdout(log(root, "api.out.log"))
+        .stderr(log(root, "api.err.log"))
+        .spawn()
+        .unwrap();
+    if !scoped {
+        writeln!(child.stdin.take().unwrap(), "{KEY}").unwrap();
+    }
+    Process(child)
+}
+
+#[tokio::test]
+#[ignore = "requires discrete GPU; scoped product workflow and restart"]
+async fn scoped_product_workflow_survives_restart() {
+    let root = std::env::temp_dir().join(format!("gpu-product-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let credentials: Vec<_> = [
+        ("admin", "Administrator", KEY.to_string()),
+        ("bank", "InternalWriter", "b".repeat(40)),
+        ("provider", "ProviderWriter", "p".repeat(40)),
+        ("audit", "Auditor", "a".repeat(40)),
+        ("investigator", "Investigator", "i".repeat(40)),
+    ]
+    .into_iter()
+    .map(|(id, role, api_key)| json!({"id":id,"role":role,"api_key":api_key}))
+    .collect();
+    std::fs::write(root.join("tenant.json"),serde_json::to_vec(&json!([{"id":"bank-a","database":root.join("events.sqlite3"),"credentials":credentials}])).unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let url = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut server = api(&root, port, 100);
+    wait_ready(&http, &url).await;
+    let event = |source: &str, version: u64, amount: u64| json!({"event_id":format!("{source}-{version}"),"source":source,"version":version,"payment":{"id":"p1","amount_minor":amount,"currency":"GBP","status":"Completed"}});
+    let send = |key: String, body: Value| {
+        http.post(format!("{url}/v1/gpu/events"))
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+    };
+    assert_eq!(
+        send(
+            "p".repeat(40),
+            json!({"request_id":"forbidden","events":[event("Internal",1,100)]})
+        )
+        .await
+        .unwrap()
+        .status(),
+        403
+    );
+    assert_eq!(
+        send(
+            "b".repeat(40),
+            json!({"request_id":"bank-1","events":[event("Internal",1,100)]})
+        )
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    let payment: Value = http
+        .get(format!("{url}/v1/gpu/payments/p1"))
+        .bearer_auth("a".repeat(40))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(payment["awaiting_counterpart"], true);
+    assert_eq!(
+        send(
+            "p".repeat(40),
+            json!({"request_id":"provider-1","events":[event("Provider",1,90)]})
+        )
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    let feed: Value = http
+        .get(format!("{url}/v1/gpu/findings?after=0&limit=20"))
+        .bearer_auth("a".repeat(40))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cursor = feed["next_cursor"].as_i64().unwrap();
+    assert_eq!(feed["entries"].as_array().unwrap().len(), 2);
+    let note = json!({"request_id":"note-1","note":"Provider contacted","acknowledged":true});
+    assert_eq!(
+        http.post(format!("{url}/v1/gpu/payments/p1/investigation"))
+            .bearer_auth("a".repeat(40))
+            .json(&note)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            http.post(format!("{url}/v1/gpu/payments/p1/investigation"))
+                .bearer_auth("i".repeat(40))
+                .json(&note)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    assert_eq!(
+        http.post(format!("{url}/v1/gpu/checkpoint"))
+            .bearer_auth("a".repeat(40))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        http.get(format!("{url}/v1/gpu/findings"))
+            .bearer_auth("other-tenant-key-not-authorized-0123456789")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        send(
+            "p".repeat(40),
+            json!({"request_id":"provider-2","events":[event("Provider",2,100)]})
+        )
+        .await
+        .unwrap()
+        .status(),
+        200
+    );
+    drop(server);
+    server = api(&root, port, 100);
+    wait_ready(&http, &url).await;
+    let feed: Value = http
+        .get(format!("{url}/v1/gpu/findings?after={cursor}"))
+        .bearer_auth("a".repeat(40))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(feed["entries"][0]["changes"][0]["transition"], "Resolved");
+    let notes: Value = http
+        .get(format!("{url}/v1/gpu/payments/p1/investigation"))
+        .bearer_auth("a".repeat(40))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(notes["entries"].as_array().unwrap().len(), 1);
+    let history: Value = http
+        .get(format!("{url}/v1/gpu/payments/p1/history"))
+        .bearer_auth("a".repeat(40))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(history["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        history["entries"][1]["evidence"][0]["payment"]["amount_minor"],
+        90
+    );
+    println!(
+        "Scoped GPU product recovery passed; evidence: {}",
+        root.display()
+    );
+    drop(server);
 }
 fn stream(root: &Path, args: &[String], label: &str, pause: bool) -> Process {
     let mut c = Command::new(env!("CARGO_BIN_EXE_payment-stream"));
-    c.args(args).env("RECONCILE_API_KEY", KEY);
+    c.args(args)
+        .env_remove("RECONCILE_API_KEY")
+        .env_remove("PAYMENT_STREAM_INTERNAL_KEY")
+        .env_remove("PAYMENT_STREAM_PROVIDER_KEY")
+        .env("PAYMENT_STREAM_KEY_STDIN", "1")
+        .stdin(Stdio::piped());
     if pause {
         c.env("PAYMENT_STREAM_TEST_PAUSE_AFTER_ACK_MS", "10000")
             .env("PAYMENT_STREAM_TEST_PAUSE_FILE", root.join("pause"));
@@ -55,12 +248,15 @@ fn stream(root: &Path, args: &[String], label: &str, pause: bool) -> Process {
     if args[0] == "generate" {
         c.env("PAYMENT_STREAM_START_FILE", root.join("start"));
     }
-    Process(
-        c.stdout(log(root, &format!("{label}.jsonl")))
-            .stderr(log(root, &format!("{label}.err.log")))
-            .spawn()
-            .unwrap(),
-    )
+    let mut child = c
+        .stdout(log(root, &format!("{label}.jsonl")))
+        .stderr(log(root, &format!("{label}.err.log")))
+        .spawn()
+        .unwrap();
+    if args[0] == "consume" {
+        writeln!(child.stdin.take().unwrap(), "{KEY}").unwrap();
+    }
+    Process(child)
 }
 fn rows(root: &Path, label: &str) -> Vec<Value> {
     BufReader::new(File::open(root.join(format!("{label}.jsonl"))).unwrap())
@@ -94,6 +290,29 @@ fn pct(mut values: Vec<f64>, p: f64) -> f64 {
         .saturating_sub(1)
         .min(values.len() - 1)]
 }
+async fn wait_consumer(root: &Path, process: &mut Process, expected: usize) {
+    let began = Instant::now();
+    loop {
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "Consumer exited before readiness; inspect evidence"
+        );
+        let log = std::fs::read_to_string(root.join("consumer.jsonl")).unwrap();
+        if log
+            .lines()
+            .filter(|l| l.contains("\"kind\":\"consumer_ready\""))
+            .count()
+            >= expected
+        {
+            return;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(90),
+            "Consumer readiness timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires running Kafka on loopback and a discrete GPU"]
 async fn sustained_burst_and_restart() {
@@ -106,7 +325,13 @@ async fn sustained_burst_and_restart() {
         .unwrap_or("2000".into())
         .parse()
         .unwrap();
-    let burst_rate = rate * 5;
+    let mode = std::env::var("STREAM_TEST_MODE").unwrap_or("combined".into());
+    assert!(["combined", "burst", "restart", "steady"].contains(&mode.as_str()));
+    let burst_rate = if mode == "restart" || mode == "steady" {
+        rate
+    } else {
+        rate * 5
+    };
     let burst_start = seconds / 3;
     let burst_duration = (seconds / 6).min(10);
     let count = seconds * rate + burst_duration * (burst_rate - rate);
@@ -144,6 +369,7 @@ async fn sustained_burst_and_restart() {
         root.join("cursor.sqlite3").to_string_lossy().into_owned(),
     ];
     let mut consumer = stream(&root, &consume, "consumer", true);
+    wait_consumer(&root, &mut consumer, 1).await;
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
     let mut producers = Vec::new();
@@ -171,37 +397,45 @@ async fn sustained_burst_and_restart() {
     let started = Instant::now();
     let started_ms = chrono::Utc::now().timestamp_millis();
     println!("Both generator tasks ready; synchronized traffic started");
-    // Let steady and burst traffic run, then kill between API ACK and cursor commit.
-    tokio::time::sleep(Duration::from_secs(burst_start + burst_duration + 1)).await;
-    std::fs::write(root.join("pause"), b"inject").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if rows(&root, "consumer")
-            .iter()
-            .any(|v| v["kind"] == "ack_before_cursor")
-        {
-            break;
+    let mut stopped_at = 0.;
+    let mut recovery_s = 0.;
+    let mut consumer_recovery_s = 0.;
+    if mode == "combined" || mode == "restart" {
+        // Let steady and burst traffic run, then kill between API ACK and cursor commit.
+        tokio::time::sleep(Duration::from_secs(burst_start + burst_duration + 1)).await;
+        std::fs::write(root.join("pause"), b"inject").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if rows(&root, "consumer")
+                .iter()
+                .any(|v| v["kind"] == "ack_before_cursor")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "No injected ACK boundary reached"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "No injected ACK boundary reached"
+        drop(consumer);
+        drop(server);
+        std::fs::remove_file(root.join("pause")).unwrap();
+        stopped_at = started.elapsed().as_secs_f64();
+        println!(
+            "Forced consumer/API stop at {stopped_at:.2}s after durable ACK, before cursor commit"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await; // producers continue, Kafka accumulates backlog.
+        let restart = Instant::now();
+        server = api(&root, port, count as usize);
+        wait_ready(&http, &url).await;
+        recovery_s = restart.elapsed().as_secs_f64();
+        println!("GPU API recovered in {recovery_s:.2}s; resuming retained record");
+        consumer = stream(&root, &consume, "consumer", false);
+        let resuming = Instant::now();
+        wait_consumer(&root, &mut consumer, 2).await;
+        consumer_recovery_s = resuming.elapsed().as_secs_f64();
     }
-    drop(consumer);
-    drop(server);
-    std::fs::remove_file(root.join("pause")).unwrap();
-    let stopped_at = started.elapsed().as_secs_f64();
-    println!(
-        "Forced consumer/API stop at {stopped_at:.2}s after durable ACK, before cursor commit"
-    );
-    tokio::time::sleep(Duration::from_secs(3)).await; // producers continue, Kafka accumulates backlog.
-    let restart = Instant::now();
-    server = api(&root, port, count as usize);
-    wait_ready(&http, &url).await;
-    let recovery_s = restart.elapsed().as_secs_f64();
-    println!("GPU API recovered in {recovery_s:.2}s; resuming retained record");
-    consumer = stream(&root, &consume, "consumer", false);
     let mut producer_summary = Vec::new();
     for p in producers {
         producer_summary.push(
@@ -281,10 +515,12 @@ async fn sustained_burst_and_restart() {
         .map(|v| v["events"].as_u64().unwrap())
         .sum();
     assert!(expected_events >= producer_events);
-    assert!(
-        committed.iter().any(|v| v["duplicate"] == true),
-        "Lost-ACK record was not retried exactly"
-    );
+    if mode == "combined" || mode == "restart" {
+        assert!(
+            committed.iter().any(|v| v["duplicate"] == true),
+            "Lost ACK was not retried"
+        );
+    }
     assert_eq!(committed.len() as u64, expected_records);
     assert_eq!(
         committed
@@ -338,7 +574,11 @@ async fn sustained_burst_and_restart() {
         db.query_row("SELECT count(*) FROM gpu_requests", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        expected_records as i64
+        committed
+            .iter()
+            .map(|v| v["request_id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64
     );
     assert_eq!(
         db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
@@ -369,7 +609,29 @@ async fn sustained_burst_and_restart() {
         serde_json::to_vec(&committed).unwrap(),
     )
     .unwrap();
-    let report = json!({"validated":true,"startup_profiles":startup_profiles,"timeline":timeline,"producer_acknowledged_records":producer_records,"payments":count,"unique_source_events":count*3,"delivered_events_including_duplicates":expected_events,"kafka_records":expected_records,"started_at_ms":started_ms,"configured_seconds":seconds,"base_payments_per_source_per_s":rate,"burst_payments_per_source_per_s":burst_rate,"burst_start_s":burst_start,"burst_duration_s":burst_duration,"producers_finished_s":produced_at,"all_durable_s":all_durable_s,"effective_unique_events_per_s":count as f64*3.0/all_durable_s,"stop_at_s":stopped_at,"restart_to_ready_s":recovery_s,"post_producer_drain_s":all_durable_s-produced_at,"snapshot_checks":checks,"end_to_end_record_latency_ms":{"p50":pct(latency.clone(),0.5),"p95":pct(latency.clone(),0.95),"p99":pct(latency.clone(),0.99),"max":pct(latency,1.0)},"producer_summaries":producer_summary,"ambiguous_retry_confirmed":true,"broker":"Apache Kafka 4.0.1, one local broker, replication factor 1","durability":"GPU journal and consumer cursor SQLite WAL synchronous FULL; pending retained before HTTP; cursor advances after durable ACK"});
+    let profiles: Vec<Value> = std::fs::read_to_string(root.join("api.err.log"))
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.strip_prefix("GPU_PROFILE "))
+        .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(|v| v["phase"] == "apply")
+        .collect();
+    let mut stages = serde_json::Map::new();
+    for field in [
+        "queue_ms",
+        "preparation_ms",
+        "identity_ms",
+        "compute_ms",
+        "journal_ms",
+        "commit_ms",
+        "total_ms",
+    ] {
+        let values: Vec<f64> = profiles.iter().filter_map(|v| v[field].as_f64()).collect();
+        if !values.is_empty() {
+            stages.insert(field.into(),json!({"p50":pct(values.clone(),0.5),"p95":pct(values.clone(),0.95),"p99":pct(values,0.99)}));
+        }
+    }
+    let report = json!({"validated":true,"gpu_stages_ms":stages,"consumer_concurrency":std::env::var("PAYMENT_STREAM_CONCURRENCY").unwrap_or("2".into()),"batch_events":std::env::var("PAYMENT_STREAM_BATCH_EVENTS").unwrap_or("2048".into()),"startup_profiles":startup_profiles,"timeline":timeline,"producer_acknowledged_records":producer_records,"payments":count,"unique_source_events":count*3,"delivered_events_including_duplicates":expected_events,"kafka_records":expected_records,"started_at_ms":started_ms,"configured_seconds":seconds,"base_payments_per_source_per_s":rate,"burst_payments_per_source_per_s":burst_rate,"burst_start_s":burst_start,"burst_duration_s":burst_duration,"producers_finished_s":produced_at,"all_durable_s":all_durable_s,"effective_unique_events_per_s":count as f64*3.0/all_durable_s,"stop_at_s":stopped_at,"restart_to_ready_s":recovery_s,"consumer_restart_to_ready_s":consumer_recovery_s,"initial_consumer_ready_before_generation":true,"post_producer_drain_s":all_durable_s-produced_at,"snapshot_checks":checks,"end_to_end_record_latency_ms":{"p50":pct(latency.clone(),0.5),"p95":pct(latency.clone(),0.95),"p99":pct(latency.clone(),0.99),"max":pct(latency,1.0)},"producer_summaries":producer_summary,"mode":mode,"ambiguous_retry_confirmed":committed.iter().any(|v|v["duplicate"]==true),"broker":"Apache Kafka 4.0.1, one local broker, replication factor 1","durability":"GPU journal and consumer cursor SQLite WAL synchronous FULL; pending retained before HTTP; cursor advances after durable ACK"});
     std::fs::write(
         root.join("report.json"),
         serde_json::to_vec_pretty(&report).unwrap(),

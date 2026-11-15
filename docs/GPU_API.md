@@ -119,13 +119,13 @@ bytes; payment IDs at most 256. Existing API body, rate, concurrency and timeout
 limits also apply. Capacity exhaustion returns 422; full/unavailable GPU queues
 return 503. No CPU fallback is used.
 
-GPU mode requires `RECONCILE_API_KEY` and rejects `RECONCILE_TENANTS_FILE`. Its token
-currently has administrator access; use separate processes/journals for isolation.
-Existing source-scoped multi-tenant and partitioned CPU endpoints retain their
-existing behavior. GPU state uses its own namespace and **is not mirrored into
-the legacy `/v1/events` store**. Existing waiting deadlines, investigation history,
-webhooks and source-role credentials are not yet integrated into GPU endpoints.
-
+GPU mode accepts a legacy administrator `RECONCILE_API_KEY` or exactly one tenant
+in `RECONCILE_TENANTS_FILE` with scoped credentials. Use dedicated processes and
+journals per company. The journal binds its owner across restarts. See
+[GPU operations](GPU_OPERATIONS.md) for source permissions, the durable findings
+feed, indexed history, investigation notes and read-time matching windows.
+GPU state is not mirrored into the legacy `/v1/events` store; its webhooks and
+automatic deadline event worker remain separate.
 Automatic checkpoints default to every 256 newly committed batches. Set
 `RECONCILE_GPU_CHECKPOINT_BATCHES` to 1..1,000,000 to change the interval. Publication
 uses one bounded background publisher. Only immutable GPU snapshot capture pauses

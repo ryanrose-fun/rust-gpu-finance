@@ -1067,9 +1067,19 @@ mod admission_tests;
 #[utoipa::path(get,path="/metrics",security(("bearerAuth"=[])),responses((status=200,description="Tenant Prometheus metrics, reset on restart",body=String,content_type="text/plain"),(status=401,description="Invalid credential",body=ErrorEnvelope)))]
 async fn export_metrics(State(state): State<AppState>) -> Response {
     let (queued, active) = state.event_queue.depth();
+    let rendered = state.metrics.render(queued, active);
+    #[cfg(feature = "gpu")]
+    let rendered = if let Some(gpu) = &state.config.gpu {
+        format!(
+            "{rendered}\n# TYPE reconcile_gpu_admitted_requests gauge\nreconcile_gpu_admitted_requests {}\n",
+            gpu.admitted_requests()
+        )
+    } else {
+        rendered
+    };
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        state.metrics.render(queued, active),
+        rendered,
     )
         .into_response()
 }
