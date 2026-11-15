@@ -1,4 +1,6 @@
 //! Explicit-partition Kafka tools for the GPU API. No CPU reconciliation fallback.
+pub mod adapter;
+mod consumer;
 mod store;
 use chrono::Utc;
 use rskafka::{
@@ -46,7 +48,7 @@ pub async fn run(
     let command = args.get(1).map(String::as_str).unwrap_or("help");
     if command == "help" {
         println!(
-            "payment-stream init <broker> <run>\npayment-stream generate <broker> <run> <Internal|Provider> <seconds> <payments/s> <burst-start-s> <burst-duration-s> <burst-payments/s>\npayment-stream consume <broker> <run> <api-url> <state.sqlite3>\nUse a NEW run ID for each dataset. Set RECONCILE_API_KEY for consume. Kafka is local plaintext only."
+            "payment-stream init <broker> <run>\npayment-stream generate <broker> <run> <Internal|Provider> <seconds> <payments/s> <burst-start-s> <burst-duration-s> <burst-payments/s>\npayment-stream consume <broker> <run> <api-url> <state.sqlite3>\npayment-stream status <broker> <run> <api-url> <state.sqlite3>\npayment-stream import <broker> <run> <Internal|Provider> <mapping.json> <input.json>\nUse a NEW run ID for each dataset. Set RECONCILE_API_KEY for consume. Kafka is local plaintext only."
         );
         return Ok(None);
     }
@@ -86,6 +88,10 @@ pub async fn run(
             }
         }
         println!("Created independent internal/provider topics for {run}");
+        return Ok(None);
+    }
+    if command == "import" {
+        adapter::import(&client, run, &args).await?;
         return Ok(None);
     }
     if command == "generate" {
@@ -177,91 +183,30 @@ pub async fn run(
         println!("{summary}");
         return Ok(Some(summary));
     }
+    if command == "status" {
+        consumer::status(&client, run, arg(&args, 5)?).await?;
+        return Ok(None);
+    }
     if command != "consume" {
         return Err("Unknown command".into());
     }
     let api = arg(&args, 4)?.trim_end_matches('/');
-    let key = std::env::var("RECONCILE_API_KEY")?;
+    let key = if std::env::var("PAYMENT_STREAM_KEY_STDIN").as_deref() == Ok("1") {
+        use std::io::{BufRead, Read};
+        let mut key = String::new();
+        std::io::stdin().lock().take(4097).read_line(&mut key)?;
+        if key.len() > 4096 || key.trim().is_empty() {
+            return Err("Missing or oversized stdin credential".into());
+        }
+        key.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        std::env::var("RECONCILE_API_KEY").unwrap_or_default()
+    };
     if !local_api_url(api) {
         return Err("This local integration requires a loopback GPU API".into());
     }
-    let mut store = store::Store::open(arg(&args, 5)?, &format!("{broker}|{run}|{api}"))?;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let mut partitions = Vec::new();
-    for source in ["internal", "provider"] {
-        let topic = format!("{run}-{source}");
-        partitions.push((
-            topic.clone(),
-            client
-                .partition_client(topic, 0, UnknownTopicHandling::Error)
-                .await?,
-        ));
-    }
-    loop {
-        let mut progressed = false;
-        for (topic, partition) in &partitions {
-            if let Some(pending) = store.pending()? {
-                deliver(&http, api, &key, &mut store, pending).await?;
-                progressed = true;
-            }
-            let offset = store.offset(topic)?;
-            let (records, high) = tokio::time::timeout(
-                Duration::from_secs(30),
-                partition.fetch_records(offset, 1..1_048_576, 0),
-            )
-            .await??;
-            if high < offset {
-                return Err("Kafka log was truncated/recreated below durable cursor".into());
-            }
-            progressed |= !records.is_empty();
-            for record in records.into_iter().take(4) {
-                if record.offset != store.offset(topic)? {
-                    return Err(
-                        "Kafka retention gap or non-contiguous offset: refusing to skip evidence"
-                            .into(),
-                    );
-                }
-                let data = record
-                    .record
-                    .value
-                    .ok_or("Tombstones are not valid payment records")?;
-                if data.len() > 1_048_576 {
-                    return Err("Record exceeds 1 MiB limit".into());
-                }
-                let env: Envelope = serde_json::from_slice(&data)?;
-                if env.schema != 1 || env.events.is_empty() || env.events.len() > 512 {
-                    return Err("Unsupported envelope schema or event count".into());
-                }
-                let expected_source = if topic.ends_with("-internal") {
-                    "Internal"
-                } else {
-                    "Provider"
-                };
-                if env.events.iter().any(|e| e["source"] != expected_source) {
-                    return Err("Event source does not match its topic".into());
-                }
-                let body = serde_json::to_string(
-                    &json!({"request_id":request_id(topic,record.offset),"events":env.events}),
-                )?;
-                let pending = store::Pending {
-                    topic: topic.clone(),
-                    offset: record.offset,
-                    body,
-                    created_ms: env.created_at_ms,
-                    events: env.events.len(),
-                    high_watermark: high,
-                };
-                store.prepare(&pending)?;
-                deliver(&http, api, &key, &mut store, pending).await?;
-            }
-        }
-        // Never long-poll an empty source while its counterpart has backlog.
-        if !progressed {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
+    consumer::consume(&client, broker, run, api, &key, arg(&args, 5)?).await?;
+    Ok(None)
 }
 fn local_api_url(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|u| {
@@ -317,7 +262,7 @@ async fn deliver(
     http: &reqwest::Client,
     api: &str,
     key: &str,
-    store: &mut store::Store,
+    store: &std::sync::Arc<std::sync::Mutex<store::Store>>,
     p: store::Pending,
 ) -> Result<()> {
     let started = Instant::now();
@@ -350,8 +295,11 @@ async fn deliver(
                     );
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                let metrics = json!({"kind":"committed","topic":p.topic,"offset":p.offset,"events":p.events,"remaining_records_at_fetch":(p.high_watermark-p.offset-1).max(0),"created_at_ms":p.created_ms,"committed_at_ms":Utc::now().timestamp_millis(),"end_to_end_ms":(Utc::now().timestamp_millis()-p.created_ms).max(0),"http_ms":started.elapsed().as_secs_f64()*1000.0,"attempts":attempt+1,"duplicate":v["duplicate"]});
-                store.complete(&p, &metrics)?;
+                let metrics = json!({"kind":"committed","request_id":expected["request_id"],"topic":p.topic,"offset":p.offset,"events":p.events,"remaining_records_at_fetch":(p.high_watermark-p.offset-1).max(0),"created_at_ms":p.created_ms,"committed_at_ms":Utc::now().timestamp_millis(),"end_to_end_ms":(Utc::now().timestamp_millis()-p.created_ms).max(0),"http_ms":started.elapsed().as_secs_f64()*1000.0,"attempts":attempt+1,"duplicate":v["duplicate"]});
+                store
+                    .lock()
+                    .map_err(|_| "Cursor lock poisoned")?
+                    .complete(&p, &metrics)?;
                 println!("{metrics}");
                 return Ok(());
             }

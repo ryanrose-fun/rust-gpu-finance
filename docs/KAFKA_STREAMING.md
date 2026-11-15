@@ -37,7 +37,7 @@ $run = 'demo-' + [guid]::NewGuid().ToString('N')
 
 Start the GPU API using [its guide](GPU_API.md). Set capacity to at least the expected
 number of distinct payments and retain its data directory. Set the same
-`RECONCILE_API_KEY` in the consumer terminal. Keep the API URL stable across restart.
+`RECONCILE_API_KEY` in the consumer terminal, or use separate source keys as described in [GPU operations](GPU_OPERATIONS.md). Keep the API URL stable across restart.
 
 In another terminal, substituting the same broker/run values:
 
@@ -58,7 +58,7 @@ starting at 30 seconds lasting 10 seconds at 10,000 payments/source/second. Gene
 uses scheduled 100 ms ticks and records achieved timing/schedule lag. If publishing
 falls behind, it catches up; configured rate is not automatically achieved rate.
 Each Kafka record holds up to 512 same-source events. The consumer fetches bounded
-chunks and alternates between topics without blocking on an empty source; it sleeps briefly only when both are idle. HTTP sends one Kafka record per request.
+chunks with one ordered worker per source. At most two HTTP batches are in flight; adjacent records with distinct payments can be combined without waiting to fill a batch. See [controls and recovery](GPU_OPERATIONS.md).
 
 Internal emits Completed version 1. Provider emits Pending version 1 then final
 version 2, with an old duplicate after selected completions. Every tenth payment has
@@ -86,7 +86,7 @@ API journal.
 ## Delivery and recovery
 
 The consumer stores exact request bytes and source offset in SQLite WAL/FULL before
-HTTP delivery. Its request ID derives from topic/partition/offset. After a valid
+HTTP delivery. Its request ID derives from topic/partition/offset range. After a valid
 GPU durable acknowledgement, cursor advancement and pending removal commit together.
 A crash between those steps resends the exact request and receives the cached GPU
 receipt. This is at-least-once delivery with idempotent application, not a distributed
@@ -127,7 +127,8 @@ kills/restarts the API while producers continue, drains the backlog and validate
 final evidence after another restart. It retains JSONL measurements and a summary.
 `PAYMENT_STREAM_TEST_PAUSE_AFTER_ACK_MS` plus `PAYMENT_STREAM_TEST_PAUSE_FILE` enable a bounded acceptance fault-injection hook;
 leave it unset in normal use. Hardware tests are explicit; ordinary CI runs portable
-checks without requiring a broker or GPU. See [results](performance/kafka-gpu-streaming.md).
+checks without requiring a broker or GPU. See the [concurrency and batching validation](performance/gpu-streaming-product.md)
+and the [original polling experiment](performance/kafka-gpu-streaming.md).
 
 The test stops its child API/consumer processes and completes its generator tasks. Kafka is operator-owned
 and must be stopped separately. Evidence and topics are retained for inspection.

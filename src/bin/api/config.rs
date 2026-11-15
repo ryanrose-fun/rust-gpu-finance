@@ -6,6 +6,7 @@ pub struct Config {
     pub gpu: Option<std::sync::Arc<super::gpu_service::Client>>,
     pub bind: SocketAddr,
     pub scoped_auth: bool,
+    pub gpu_match_wait_ms: u64,
     pub deadline_worker: bool,
     pub api_key: Option<String>,
     pub tenant_file: Option<std::path::PathBuf>,
@@ -25,6 +26,7 @@ impl Default for Config {
             gpu: None,
             bind: "127.0.0.1:3000".parse().unwrap(),
             scoped_auth: false,
+            gpu_match_wait_ms: 30_000,
             deadline_worker: false,
             api_key: None,
             tenant_file: None,
@@ -49,6 +51,15 @@ impl Config {
             c.bind = v.parse().map_err(|_| "Invalid RECONCILE_BIND")?;
         }
         c.api_key = std::env::var("RECONCILE_API_KEY").ok();
+        if std::env::var("RECONCILE_API_KEY_STDIN").as_deref() == Ok("1") {
+            c.api_key = Some(read_key(std::io::stdin().lock())?);
+        }
+        if let Ok(value) = std::env::var("RECONCILE_GPU_MATCH_WAIT_MS") {
+            c.gpu_match_wait_ms = value.parse().map_err(|_| "Invalid GPU matching window")?;
+            if c.gpu_match_wait_ms > 86_400_000 {
+                return Err("GPU matching window cannot exceed one day".into());
+            }
+        }
         c.tenant_file = std::env::var_os("RECONCILE_TENANTS_FILE").map(Into::into);
         if c.tenant_file
             .as_ref()
@@ -108,9 +119,29 @@ fn number(name: &str, default: usize, max: usize) -> Result<usize, String> {
             .ok_or_else(|| format!("{name} must be between 1 and {max}")),
     }
 }
+fn read_key(input: impl std::io::BufRead) -> Result<String, String> {
+    use std::io::BufRead;
+    let mut key = String::new();
+    input
+        .take(4097)
+        .read_line(&mut key)
+        .map_err(|_| "Cannot read stdin credential")?;
+    if key.len() > 4096 || key.trim().is_empty() {
+        return Err("Missing or oversized stdin credential".into());
+    }
+    Ok(key.trim_end_matches(['\r', '\n']).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stdin_key_is_bounded_and_eof_fails_closed() {
+        assert!(read_key(&b""[..]).is_err());
+        assert!(read_key(&b"\n"[..]).is_err());
+        assert!(read_key(&vec![b'x'; 4097][..]).is_err());
+        assert_eq!(read_key(&b"a-secret\r\n"[..]).unwrap(), "a-secret");
+    }
     #[test]
     fn public_binding_requires_key() {
         let mut c = Config {

@@ -10,6 +10,7 @@ This engine reviews payments; it does not execute or settle them.
 - A resident GPU worker behind an authenticated HTTP API.
 - Durable acknowledgements and background checkpoints with verified recovery.
 - Kafka ingestion and independent Rust payment generators for streaming experiments.
+- Resumable findings, payment history, investigation notes and source-scoped credentials.
 - Reproducible correctness, recovery and performance tests.
 
 ## Get started
@@ -27,6 +28,7 @@ cargo test --locked --all-features
 
 - **[GPU API setup](docs/GPU_API.md)** — configuration, requests and restart recovery.
 - **[Kafka streaming guide](docs/KAFKA_STREAMING.md)** — broker, generators, ingestion and fault tests.
+- **[GPU operations](docs/GPU_OPERATIONS.md)** — batching, source mappings, findings and investigation.
 - **[Architecture](docs/GPU_ARCHITECTURE.md)** — state ownership and durability boundaries.
 - **[Documentation index](docs/README.md)** — existing library/CLI, deployment and integration guides.
 
@@ -34,7 +36,7 @@ cargo test --locked --all-features
 
 [Latest checkpoint measurements](docs/performance/gpu-api-background-checkpoints.md)
 cover one million payments, durable HTTP ingestion and forced restart recovery.
-[Kafka streaming results](docs/performance/kafka-gpu-streaming.md) cover sustained
+[Kafka streaming validation](docs/performance/gpu-streaming-product.md) covers sustained
 traffic, bursts and consumer/API restart. These are workload-specific local results,
 not a claim of bank deployment capacity. Raw measurements and methodology accompany
 each report; older experiments remain available for comparison.

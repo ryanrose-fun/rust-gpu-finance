@@ -1,5 +1,6 @@
 //! Single-owner GPU actor. Acknowledgements follow a FULL SQLite commit.
 mod checkpoints;
+pub mod product;
 use gpu_compute::{
     Gpu,
     resident::{Change, Event, Receipt, Worker},
@@ -60,6 +61,7 @@ enum Command {
     Checkpoint(oneshot::Sender<Answer>),
     Get(String, oneshot::Sender<Answer>),
     Health(oneshot::Sender<Answer>),
+    Product(product::Query, oneshot::Sender<Answer>),
     Stop(oneshot::Sender<()>),
 }
 pub struct Client {
@@ -68,7 +70,10 @@ pub struct Client {
     preparation_slots: Arc<tokio::sync::Semaphore>,
 }
 impl Client {
-    pub fn start(path: PathBuf, capacity: usize) -> Result<Arc<Self>, String> {
+    pub fn admitted_requests(&self) -> usize {
+        32 - self.preparation_slots.available_permits()
+    }
+    pub fn start(path: PathBuf, capacity: usize, tenant: String) -> Result<Arc<Self>, String> {
         if !path.is_absolute() || path.file_name() != Some(std::ffi::OsStr::new("gpu.sqlite3")) {
             return Err("GPU database must be an absolute path ending in gpu.sqlite3".into());
         }
@@ -95,7 +100,7 @@ impl Client {
             .name("gpu-journal-owner".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(path, capacity, rx, &ready)
+                    run(path, capacity, rx, &ready, &tenant)
                 }));
                 status.store(false, Ordering::Release);
                 match outcome {
@@ -152,8 +157,14 @@ impl Client {
     pub async fn get(&self, id: String) -> Answer {
         self.call(|tx| Command::Get(id, tx)).await
     }
+    pub async fn product(&self, query: product::Query) -> Answer {
+        self.call(|tx| Command::Product(query, tx)).await
+    }
     pub async fn health(&self) -> Answer {
-        self.call(Command::Health).await
+        let mut health = self.call(Command::Health).await?;
+        health["available_preparation_slots"] =
+            serde_json::json!(self.preparation_slots.available_permits());
+        Ok(health)
     }
     pub async fn shutdown(&self) {
         let sender = self.tx.clone();
@@ -172,6 +183,7 @@ struct Prepared {
     input_sha: String,
     event_json: Vec<String>,
     preparation_ms: f64,
+    queued_at: std::time::Instant,
 }
 impl Prepared {
     fn new(request: Submit) -> Result<Self, Error> {
@@ -182,6 +194,7 @@ impl Prepared {
         let event_json = request.events.iter().map(canonical).collect();
         Ok(Self {
             _slot: None,
+            queued_at: std::time::Instant::now(),
             request,
             input,
             input_sha,
@@ -255,6 +268,7 @@ fn run(
     capacity: usize,
     rx: mpsc::Receiver<Command>,
     ready: &mpsc::SyncSender<Result<(), String>>,
+    tenant: &str,
 ) -> Result<(), String> {
     let startup = std::time::Instant::now();
     let profile = std::env::var_os("RECONCILE_GPU_PROFILE").is_some();
@@ -318,6 +332,7 @@ fn run(
     let gpu = Gpu::try_new()?;
     let adapter = gpu.info.name.clone();
     let mut worker = Worker::new(&gpu, capacity, MAX_EVENTS);
+    product::initialize(&mut db, tenant)?;
     let mut committed = 0i64;
     let mut chain = String::new();
     let legacy_checkpoint: Option<checkpoints::Stored> = db
@@ -452,6 +467,9 @@ fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match command {
+            Command::Product(query, reply) => {
+                let _ = reply.send(product::query(&mut db, query));
+            }
             Command::Health(reply) => {
                 let _=reply.send(Ok(serde_json::json!({"status":"ready","backend":"gpu","adapter":adapter,"committed_batches":committed,"checkpoint_sequence":checkpoint_at,"checkpoint_in_flight":pending.as_ref().map(|p|p.seq),"capacity":capacity,"durability":"sqlite-wal-full","recovered_before_ready":true})));
             }
@@ -616,6 +634,7 @@ fn apply(
         ],
     )?;
     let seq = tx.last_insert_rowid();
+    product::index(&tx, seq, request)?;
     {
         let mut insert = tx.prepare_cached(
             "INSERT OR IGNORE INTO gpu_event_ids(event_id,canonical) VALUES(?1,?2)",
@@ -631,7 +650,7 @@ fn apply(
     if std::env::var_os("RECONCILE_GPU_PROFILE").is_some() {
         eprintln!(
             "GPU_PROFILE {}",
-            serde_json::json!({"phase":"apply","sequence":seq,"events":request.events.len(),"preparation_ms":prepared.preparation_ms,"identity_ms":identity_ms,"compute_ms":compute_ms,"journal_ms":journal_ms,"commit_ms":commit_ms,"total_ms":start.elapsed().as_secs_f64()*1000.0})
+            serde_json::json!({"phase":"apply","sequence":seq,"events":request.events.len(),"queue_ms":prepared.queued_at.elapsed().as_secs_f64()*1000.0-start.elapsed().as_secs_f64()*1000.0,"preparation_ms":prepared.preparation_ms,"identity_ms":identity_ms,"compute_ms":compute_ms,"journal_ms":journal_ms,"commit_ms":commit_ms,"total_ms":start.elapsed().as_secs_f64()*1000.0})
         );
     }
     Ok(Reply {

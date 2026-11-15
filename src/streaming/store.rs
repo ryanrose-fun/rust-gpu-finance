@@ -7,6 +7,12 @@ use std::{
     path::Path,
 };
 #[derive(Debug, Serialize, Deserialize)]
+pub struct RecordInfo {
+    pub offset: i64,
+    pub created_ms: i64,
+    pub events: usize,
+}
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Pending {
     pub topic: String,
     pub offset: i64,
@@ -14,6 +20,8 @@ pub struct Pending {
     pub created_ms: i64,
     pub events: usize,
     pub high_watermark: i64,
+    #[serde(default)]
+    pub records: Vec<RecordInfo>,
 }
 pub struct Store {
     db: Connection,
@@ -51,6 +59,8 @@ impl Store {
         if old != binding {
             return Err("Cursor database belongs to another broker/run/API".into());
         }
+        // Upgrade the original singleton pending request without changing its exact bytes.
+        db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS pending_batches(topic TEXT PRIMARY KEY,payload TEXT NOT NULL); INSERT OR IGNORE INTO pending_batches SELECT json_extract(payload,'$.topic'),payload FROM pending; DELETE FROM pending; COMMIT;")?;
         Ok(Self { db, _lock: lock })
     }
     pub fn offset(&self, topic: &str) -> Result<i64> {
@@ -64,10 +74,14 @@ impl Store {
             .optional()?
             .unwrap_or(0))
     }
-    pub fn pending(&self) -> Result<Option<Pending>> {
+    pub fn pending(&self, topic: &str) -> Result<Option<Pending>> {
         let raw: Option<String> = self
             .db
-            .query_row("SELECT payload FROM pending", [], |r| r.get(0))
+            .query_row(
+                "SELECT payload FROM pending_batches WHERE topic=?1",
+                [topic],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
     }
@@ -76,23 +90,58 @@ impl Store {
             return Err("Non-contiguous prepared cursor".into());
         }
         self.db.execute(
-            "INSERT INTO pending VALUES(1,?1)",
-            [serde_json::to_string(p)?],
+            "INSERT INTO pending_batches VALUES(?1,?2)",
+            params![p.topic, serde_json::to_string(p)?],
         )?;
         Ok(())
     }
     pub fn complete(&mut self, p: &Pending, metrics: &serde_json::Value) -> Result<()> {
         let tx = self.db.transaction()?;
-        let raw: String = tx.query_row("SELECT payload FROM pending", [], |r| r.get(0))?;
-        if raw != serde_json::to_string(p)? {
+        let raw: String = tx.query_row(
+            "SELECT payload FROM pending_batches WHERE topic=?1",
+            [&p.topic],
+            |r| r.get(0),
+        )?;
+        if serde_json::to_string(&serde_json::from_str::<Pending>(&raw)?)?
+            != serde_json::to_string(p)?
+        {
             return Err("Pending record changed".into());
         }
-        tx.execute("INSERT INTO cursors VALUES(?1,?2) ON CONFLICT(topic) DO UPDATE SET next_offset=excluded.next_offset",params![p.topic,p.offset+1])?;
-        tx.execute(
-            "INSERT INTO completions VALUES(?1,?2,?3)",
-            params![p.topic, p.offset, serde_json::to_string(metrics)?],
-        )?;
-        tx.execute("DELETE FROM pending", [])?;
+        let fallback = [RecordInfo {
+            offset: p.offset,
+            created_ms: p.created_ms,
+            events: p.events,
+        }];
+        let records = if p.records.is_empty() {
+            &fallback[..]
+        } else {
+            &p.records
+        };
+        if records
+            .iter()
+            .enumerate()
+            .any(|(i, r)| r.offset != p.offset + i as i64)
+        {
+            return Err("Non-contiguous pending batch".into());
+        }
+        tx.execute("INSERT INTO cursors VALUES(?1,?2) ON CONFLICT(topic) DO UPDATE SET next_offset=excluded.next_offset",params![p.topic,p.offset+records.len() as i64])?;
+        for record in records {
+            let mut metric = metrics.clone();
+            metric["offset"] = record.offset.into();
+            metric["events"] = record.events.into();
+            metric["created_at_ms"] = record.created_ms.into();
+            metric["end_to_end_ms"] = (metric["committed_at_ms"]
+                .as_i64()
+                .unwrap_or(record.created_ms)
+                - record.created_ms)
+                .max(0)
+                .into();
+            tx.execute(
+                "INSERT INTO completions VALUES(?1,?2,?3)",
+                params![p.topic, record.offset, serde_json::to_string(&metric)?],
+            )?;
+        }
+        tx.execute("DELETE FROM pending_batches WHERE topic=?1", [&p.topic])?;
         tx.commit()?;
         Ok(())
     }
@@ -100,6 +149,79 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn independent_pending_batches_recover_and_partial_completion_rolls_back() {
+        let dir = std::env::temp_dir().join(format!("parallel-cursor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("state.db");
+        let make = |topic: &str| Pending {
+            topic: topic.into(),
+            offset: 0,
+            body: format!("exact-{topic}"),
+            created_ms: 1,
+            events: 2,
+            high_watermark: 2,
+            records: vec![
+                RecordInfo {
+                    offset: 0,
+                    created_ms: 1,
+                    events: 1,
+                },
+                RecordInfo {
+                    offset: 1,
+                    created_ms: 2,
+                    events: 1,
+                },
+            ],
+        };
+        {
+            let mut s = Store::open(&path, "b").unwrap();
+            s.prepare(&make("a")).unwrap();
+            s.prepare(&make("b")).unwrap();
+        }
+        {
+            let mut s = Store::open(&path, "b").unwrap();
+            assert!(s.pending("a").unwrap().is_some());
+            assert!(s.pending("b").unwrap().is_some());
+            s.db.execute_batch("CREATE TRIGGER fail_second BEFORE INSERT ON completions WHEN NEW.offset=1 BEGIN SELECT RAISE(ABORT,'failure after first record'); END;").unwrap();
+            assert!(
+                s.complete(&make("b"), &serde_json::json!({"committed_at_ms":3}))
+                    .is_err()
+            );
+            assert_eq!(s.offset("b").unwrap(), 0);
+            assert_eq!(
+                s.db.query_row("SELECT count(*) FROM completions", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            s.db.execute_batch("DROP TRIGGER fail_second").unwrap();
+            s.complete(&make("b"), &serde_json::json!({"committed_at_ms":3}))
+                .unwrap();
+            assert_eq!(s.offset("a").unwrap(), 0);
+            assert_eq!(s.offset("b").unwrap(), 2);
+            assert!(s.complete(&make("b"), &serde_json::json!({})).is_err());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn original_pending_payload_migrates_without_changing_request_bytes() {
+        let dir = std::env::temp_dir().join(format!("old-cursor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let s = Store::open(&path, "b").unwrap();
+            s.db.execute("INSERT INTO pending VALUES(1,?1)",[r#"{"topic":"a","offset":0,"body":"original request","created_ms":1,"events":1,"high_watermark":1}"#]).unwrap();
+        }
+        {
+            let mut s = Store::open(&path, "b").unwrap();
+            let p = s.pending("a").unwrap().unwrap();
+            assert_eq!(p.body, "original request");
+            s.complete(&p, &serde_json::json!({})).unwrap();
+            assert_eq!(s.offset("a").unwrap(), 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn pending_survives_restart_and_cursor_only_advances_on_completion() {
         let dir = std::env::temp_dir().join(format!("kafka-cursor-{}", uuid::Uuid::new_v4()));
@@ -112,6 +234,7 @@ mod tests {
             created_ms: 1,
             events: 2,
             high_watermark: 1,
+            records: Vec::new(),
         };
         {
             let mut s = Store::open(&path, "binding").unwrap();
@@ -121,19 +244,19 @@ mod tests {
         }
         {
             let mut s = Store::open(&path, "binding").unwrap();
-            assert_eq!(s.pending().unwrap().unwrap().body, p.body);
+            assert_eq!(s.pending("a").unwrap().unwrap().body, p.body);
             s.db.execute_batch("CREATE TRIGGER fail_completion BEFORE INSERT ON completions BEGIN SELECT RAISE(ABORT,'injected storage failure'); END;").unwrap();
             assert!(
                 s.complete(&p, &serde_json::json!({"duplicate":true}))
                     .is_err()
             );
             assert_eq!(s.offset("a").unwrap(), 0);
-            assert!(s.pending().unwrap().is_some());
+            assert!(s.pending("a").unwrap().is_some());
             s.db.execute_batch("DROP TRIGGER fail_completion;").unwrap();
             s.complete(&p, &serde_json::json!({"duplicate":true}))
                 .unwrap();
             assert_eq!(s.offset("a").unwrap(), 1);
-            assert!(s.pending().unwrap().is_none());
+            assert!(s.pending("a").unwrap().is_none());
             assert!(s.prepare(&p).is_err());
         }
         assert!(Store::open(&path, "different").is_err());

@@ -33,6 +33,37 @@ pub struct Credential {
     pub role: Role,
 }
 impl Tenant {
+    #[cfg(feature = "gpu")]
+    pub fn validate_gpu(&self, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        let valid = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if !valid(&self.id)
+            || self.partitions != 0
+            || !self.database.is_absolute()
+            || self.database.file_name() != Some(std::ffi::OsStr::new("events.sqlite3"))
+            || self
+                .database
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err("Invalid dedicated GPU tenant configuration".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut secrets = std::collections::HashSet::new();
+        for key in self.keys()? {
+            if !valid(&key.id) || !ids.insert(key.id) || !secrets.insert(key.api_key.clone()) {
+                return Err("Invalid or duplicate GPU credential".into());
+            }
+            let mut c = config.clone();
+            c.api_key = Some(key.api_key);
+            c.validate()?;
+        }
+        Ok(())
+    }
     fn keys(&self) -> Result<Vec<Credential>, &'static str> {
         if !self.api_key.is_empty() {
             if !self.credentials.is_empty() {
@@ -62,6 +93,10 @@ pub fn build(
     config: &Config,
     entries: Vec<Tenant>,
 ) -> Result<BuiltTenants, Box<dyn std::error::Error>> {
+    #[cfg(feature = "gpu")]
+    if config.gpu.is_some() && (entries.len() != 1 || entries[0].partitions != 0) {
+        return Err("One dedicated tenant per GPU process required".into());
+    }
     if entries.is_empty() || entries.len() > 64 {
         return Err("Configure between 1 and 64 tenants".into());
     }

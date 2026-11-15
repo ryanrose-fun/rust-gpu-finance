@@ -1,0 +1,4 @@
+[
+  {"change_id":"checkout-map-1","revision":1,"state":"paid","order":{"payment_id":"MAP-001","total_minor":10000,"currency":"GBP"}},
+  {"change_id":"checkout-map-2","revision":1,"state":"paid","order":{"payment_id":"MAP-002","total_minor":5000,"currency":"GBP"}}
+]

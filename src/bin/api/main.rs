@@ -24,16 +24,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = {
         let mut config = config;
         if let Some(path) = std::env::var_os("RECONCILE_GPU_DB_PATH") {
-            if config.tenant_file.is_some()
-                || config.api_key.is_none()
+            if (config.tenant_file.is_none() && config.api_key.is_none())
                 || config.event_db.file_name() == Some(std::ffi::OsStr::new("gpu.sqlite3"))
             {
-                return Err("GPU mode requires RECONCILE_API_KEY, a separate GPU database, and one tenant per process (no tenant file)".into());
+                return Err("GPU mode requires credentials, a separate GPU database, and one tenant per process".into());
             }
             let capacity = std::env::var("RECONCILE_GPU_CAPACITY")
                 .unwrap_or_else(|_| "1000000".into())
                 .parse::<usize>()?;
-            config.gpu = Some(gpu_service::Client::start(path.into(), capacity)?);
+            let gpu_path: std::path::PathBuf = path.into();
+            let tenant = if let Some(file) = &config.tenant_file {
+                let entries: Vec<tenancy::Tenant> = serde_json::from_slice(&std::fs::read(file)?)?;
+                if entries.len() != 1 || entries[0].partitions != 0 || config.api_key.is_some() {
+                    return Err("GPU scoped mode requires exactly one tenant, no CPU partitions and no legacy key".into());
+                }
+                entries[0].validate_gpu(&config)?;
+                if gpu_path
+                    .parent()
+                    .ok_or("GPU directory missing")?
+                    .canonicalize()?
+                    != entries[0]
+                        .database
+                        .parent()
+                        .ok_or("Tenant directory missing")?
+                        .canonicalize()?
+                {
+                    return Err(
+                        "GPU and tenant event database must use the same dedicated directory"
+                            .into(),
+                    );
+                }
+                entries[0].id.clone()
+            } else {
+                "legacy-single-tenant".into()
+            };
+            config.gpu = Some(gpu_service::Client::start(gpu_path, capacity, tenant)?);
         }
         config
     };

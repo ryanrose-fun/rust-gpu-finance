@@ -1,0 +1,5 @@
+{
+  "event_id": "/change_id", "payment_id": "/order/payment_id", "version": "/revision",
+  "amount_minor": "/order/total_minor", "currency": "/order/currency", "status": "/state",
+  "statuses": {"paid": "Completed", "waiting": "Pending", "declined": "Failed"}
+}
